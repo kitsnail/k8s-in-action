@@ -66,10 +66,10 @@ ceph osd pool set default.rgw.meta crush_rule rep_ssd
   spec:
     backend_service: rgw.default
     virtual_ips_list:
-    - 10.128.0.150/16
     - 10.128.0.151/16
     - 10.128.0.152/16
     - 10.128.0.153/16
+    - 10.128.0.154/16
     first_virtual_router_id: 150
     frontend_port: 80
     monitor_port: 1967
@@ -88,10 +88,10 @@ ceph osd pool set default.rgw.meta crush_rule rep_ssd
   spec:
     backend_service: rgw.default
     virtual_ips_list:
-    - 10.128.0.150/16
     - 10.128.0.151/16
     - 10.128.0.152/16
     - 10.128.0.153/16
+    - 10.128.0.154/16
     first_virtual_router_id: 150
     frontend_port: 443
     monitor_port: 1967
@@ -122,11 +122,11 @@ ceph orch apply -i ingress.yaml
 
 ceph orch ls
 # 查询 Ingress 进程
-ceph orch ps --service_name ceph orch ps --service_name ingress.rgw.default
+ceph orch ps --service_name ingress.rgw.default
 ```
 
 配置 DNS 解析（可选）：
-* 配置 s3.example.com 节点到 10.128.0.[150-153] 的 A 记录
+* 配置 s3.example.com 节点到 10.128.0.[151-154] 的 A 记录
 
 ## 配置分层存储 (可选)
 
@@ -138,11 +138,11 @@ ceph orch ps --service_name ceph orch ps --service_name ingress.rgw.default
 * 大于等于 1M 对象，存放在缺省纠删码 HDD 上
 
 ```bash
-# 创建小对象类 StorageClass
+# 创建大对象类 StorageClass
 radosgw-admin zonegroup placement add \
     --rgw-zonegroup default \
     --placement-id default-placement \
-    --storage-class SMALL_OBJ
+    --storage-class LARGE_OBJ
 # 创建中等对象类 StorageClass
 radosgw-admin zonegroup placement add \
     --rgw-zonegroup default \
@@ -153,17 +153,29 @@ radosgw-admin zonegroup placement add \
 radosgw-admin zone placement add \
 	--rgw-zone default \
 	--placement-id default-placement \
-	--storage-class SMALL_OBJ \
-	--data-pool default.rgw.buckets.data-rep-ssd
+	--storage-class LARGE_OBJ \
+	--data-pool default.rgw.buckets.data
 radosgw-admin zone placement add \
 	--rgw-zone default \
 	--placement-id default-placement \
 	--storage-class MEDIUM_OBJ \
-	--data-pool default.rgw.buckets.data-rep-hdd
+	--data-pool default.rgw.buckets.mediumobj
+radosgw-admin zone placement modify \
+	--rgw-zone default \
+	--placement-id default-placement \
+	--storage-class STANDARD \
+	--data-pool default.rgw.buckets.smallobj
 
-# 创建数据池
-ceph osd pool create default.rgw.buckets.data-rep-ssd rep_ssd 
-ceph osd pool create default.rgw.buckets.data-rep-hdd rep_hdd 
+# 创建小对象池使用 SSD 副本
+ceph osd pool create default.rgw.buckets.smallobj rep_ssd 
+ceph osd pool application enable default.rgw.buckets.smallobj rgw
+ceph osd pool set default.rgw.buckets.smallobj target_size_ratio 0.7
+
+# 创建中对象池使用 HDD 副本
+ceph osd pool create default.rgw.buckets.mediumobj rep_hdd 
+ceph osd pool application enable default.rgw.buckets.mediumobj rgw
+ceph osd pool set default.rgw.buckets.mediumobj target_size_ratio 0.3
+ceph osd pool set default.rgw.buckets.data target_size_ratio 0.7
 
 # 重启 RGW
 ceph orch restart rgw.default
@@ -182,12 +194,12 @@ end
 
 -- apply StorageClass only if user hasn't already assigned a storage-class
 if Request.HTTP.StorageClass == nil or Request.HTTP.StorageClass == '' then
-  if Request.ContentLength < 16384 then
-    Request.HTTP.StorageClass = "SMALL_OBJ"
+  if Request.ContentLength < 8192 then
+    Request.HTTP.StorageClass = "STANDARD"
   elseif Request.ContentLength < 1048576 then
     Request.HTTP.StorageClass = "MEDIUM_OBJ"
   else
-    Request.HTTP.StorageClass = "STANDARD"
+    Request.HTTP.StorageClass = "LARGE_OBJ"
   end
   RGWDebugLog("applied '" .. Request.HTTP.StorageClass .. "' to object '" .. Request.Object.Name .. "'")
 end
@@ -202,8 +214,13 @@ radosgw-admin script put --infile=./s3.lua --context=preRequest
 ### 创建用户
 
 ```bash
+# 创建用户
 radosgw-admin user create --uid=wutz --display-name="Taizeng Wu"
+
+# 查询用户
 radosgw-admin user info --uid=wutz
+
+# 删除用户
 radosgw-admin user rm --uid=wutz
 ```
 
@@ -257,60 +274,53 @@ S3KEY=xxx
 S3SECRET=xxxxxx
 S3BUCKET=benchmark
 ELBENCHO=/usr/local/bin/elbencho
-FILES=4096
 RESFILE=s3.log
+DIRS=1
+FILES=128
+THREADS_LIST="1 4 16 64"
+SIZE_LIST="4k 128k 4m 1g"
+HOSTS_LIST="gn001 gn[001-004] gn[001-016]"
+USER=root
 
-HOSTS=$(echo ceph01 |tr ' ' ,)
-#HOSTS=$(echo ceph0{1..2} |tr ' ' ,)
-#HOSTS=$(echo ceph0{1..3} |tr ' ' ,)
+FIRST_HOST=$(echo $HOSTS_LIST | awk '{print $1}')
+LAST_HOST=$(echo $HOSTS_LIST | awk '{print $NF}')
+LAST_THREAD=$(echo $THREADS_LIST | awk '{print $NF}')
+LAST_SIZE=$(echo $SIZE_LIST | awk '{print $NF}')
 
-echo $HOSTS |tr , '\n' |xargs -I{} ssh {} $ELBENCHO --service
-sleep 3
+pdsh -w $USER@$LAST_HOST $ELBENCHO --service
 
-set -x
+for host in $HOSTS_LIST; do
+    if [ "$host" == "$FIRST_HOST" ]; then
+        thread_list=$THREADS_LIST
+    else
+        thread_list=$LAST_THREAD
+    fi
 
-for T in {1,4,16,64}; do
-#for T in 64; do
+    for threads in $thread_list; do
+        for size in $SIZE_LIST; do
+            if [[ "$size" == "$LAST_SIZE" ]]; then
+                files=1
+            else
+                files=$FILES
+            fi
 
-        N=$(($FILES/$T))
-
-        # Create bucket "S3BUCKET" for big object size
-        $ELBENCHO --hosts $HOSTS --s3endpoints $S3SERVER --s3key $S3KEY --s3secret $S3SECRET \
-                -d $S3BUCKET
-
-        # Test T threads, each creating 1 directories with N 4MiB objects inside
-        $ELBENCHO --hosts $HOSTS --s3endpoints $S3SERVER --s3key $S3KEY --s3secret $S3SECRET \
-                -w -t $T -n 1 -N $N -s 4m -b 4m --resfile $RESFILE $S3BUCKET
-
-        # Test T threads, each reading 1 directories with N 4MiB objects inside
-        $ELBENCHO --hosts $HOSTS --s3endpoints $S3SERVER --s3key $S3KEY --s3secret $S3SECRET \
-                -r -t $T -n 1 -N $N -s 4m -b 4m --resfile $RESFILE $S3BUCKET
-
-        # Delete objects and bucket created by above
-        $ELBENCHO --hosts $HOSTS --s3endpoints $S3SERVER --s3key $S3KEY --s3secret $S3SECRET \
-                -D -F -t $T -n 1 -N $N $S3BUCKET
-
-        #-------
-
-        # Create bucket "S3BUCKET" for small object size
-        $ELBENCHO --hosts $HOSTS --s3endpoints $S3SERVER --s3key $S3KEY --s3secret $S3SECRET \
-                -d $S3BUCKET
-
-        # Test T threads, each creating 4 directories with N 4KiB objects inside
-        $ELBENCHO --hosts $HOSTS --s3endpoints $S3SERVER --s3key $S3KEY --s3secret $S3SECRET \
-                -w -t $T -n 4 -N $N -s 4k -b 4k --resfile $RESFILE $S3BUCKET
-
-        # Test T threads, each reading 4 directories with N 4KiB objects inside
-        $ELBENCHO --hosts $HOSTS --s3endpoints $S3SERVER --s3key $S3KEY --s3secret $S3SECRET \
-                -r -t $T -n 4 -N $N -s 4k -b 4k --resfile $RESFILE $S3BUCKET
-
-        # Delete objects and bucket created by above
-        $ELBENCHO --hosts $HOSTS --s3endpoints $S3SERVER --s3key $S3KEY --s3secret $S3SECRET \
-                -D -F -t $T -n 4 -N $N $S3BUCKET
-
+            # Create bucket
+            $ELBENCHO --hosts $host --s3endpoints $S3SERVER --s3key $S3KEY --s3secret $S3SECRET \
+                    -d $S3BUCKET
+            # Write
+            $ELBENCHO --hosts $host --s3endpoints $S3SERVER --s3key $S3KEY --s3secret $S3SECRET \
+                    -w -t $threads -n $DIRS -N $files -s $size -b $size --resfile $RESFILE $S3BUCKET
+            # Read
+            $ELBENCHO --hosts $host --s3endpoints $S3SERVER --s3key $S3KEY --s3secret $S3SECRET \
+                    -r -t $threads -n $DIRS -N $files -s $size -b $size --resfile $RESFILE $S3BUCKET
+            # Delete
+            $ELBENCHO --hosts $host --s3endpoints $S3SERVER --s3key $S3KEY --s3secret $S3SECRET \
+                    -D -F -t $threads -n $DIRS -N $files $S3BUCKET
+        done
+    done
 done
 
-$ELBENCHO --hosts $HOSTS --quit
+$ELBENCHO --hosts $USER@$HOSTS --quit
 ```
 
 # 其它

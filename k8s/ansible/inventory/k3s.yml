@@ -1,0 +1,109 @@
+---
+k3s_cluster:
+  children:
+    server:
+      hosts:
+        172.18.15.101:
+        172.18.15.102:
+        172.18.15.103:
+    agent:
+      hosts:
+        172.18.15.104:
+
+  # Required Vars
+  vars:
+    ansible_port: 22
+    ansible_user: root
+    # access https://update.k3s.io/v1-release/channels/stable to get latest stable k3s version
+    k3s_version: v1.32.3+k3s1
+    # The token should be a random string of reasonable length. You can generate
+    # one with the following commands:
+    # - tr -dc a-z0-9 </dev/urandom | head -c 32
+    token: "krxmr046wt51ua9zbpfglrru8czpkdm0"
+    api_endpoint: "{{ hostvars[groups['server'][0]]['ansible_host'] | default(groups['server'][0]) }}"
+    # interface which will be used for cni
+    iface: ens160
+    k3s_node_ip: "{{ ansible_facts[iface]['ipv4']['address']}}"
+
+    proxy_env:
+      HTTPS_PROXY: "http://172.18.3.171:8080"
+      HTTP_PROXY: "http://172.18.3.171:8080"
+      NO_PROXY: "127.0.0.1/8,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,100.64.0.0/10,localhost,*.example.com"
+
+    # Optional vars
+    # extra_server_args: ""
+    # extra_agent_args: ""
+    # cluster_context: k3s-ansible
+    # api_port: 6443
+    # k3s_server_location: /var/lib/rancher/k3s
+    # systemd_dir: /etc/systemd/system
+    extra_server_envs: 
+    - CATTLE_NEW_SIGNED_CERT_EXPIRATION_DAYS=3650
+    # extra_agent_envs: 
+    # - FOO=BAR
+    # user_kubectl: true, by default kubectl is symlinked and configured for use by ansible_user. Set to false to only kubectl via root user.
+
+    # Manifests or Airgap should be either full paths or relative to the playbook directory.
+    # List of locally available manifests to apply to the cluster, useful for PVCs or Traefik modifications.
+    # extra_manifests: [ '/path/to/manifest1.yaml', '/path/to/manifest2.yaml' ]
+    # airgap_dir: /tmp/k3s-airgap-images
+
+    server_config_yaml: |
+      node-ip: {{ k3s_node_ip }}
+      cluster-cidr: 172.24.0.0/13
+      service-cidr: 172.23.0.0/16
+      tls-san:
+      - 172.18.15.199
+      flannel-backend: "none"
+      disable-network-policy: true
+      disable:
+      - traefik
+      - servicelb
+      - local-storage
+      embedded-registry: true
+      kubelet-arg:
+      - runtime-request-timeout=15m
+      - container-log-max-files=3
+      - container-log-max-size=10Mi
+      {% if scheduler_config_yaml is defined %}
+      kube-scheduler-arg:
+      - authentication-tolerate-lookup-failure=false
+      - config=/etc/rancher/k3s/scheduler.yaml
+      {% endif %}
+    agent_config_yaml: |
+      node-ip: {{ k3s_node_ip }}
+      kubelet-arg:
+      - runtime-request-timeout=15m
+      - container-log-max-files=3
+      - container-log-max-size=10Mi
+    registries_config_yaml: |
+      mirrors:
+        docker.io:
+          endpoint:
+            - "https://mirror.gcr.io"
+        registry.k8s.io:
+        gcr.io:
+        ghcr.io:
+        nvcr.io:
+        k8s.gcr.io:
+        quay.io:
+        cr.example.com:
+    scheduler_config_yaml: |
+      apiVersion: kubescheduler.config.k8s.io/v1
+      kind: KubeSchedulerConfiguration
+      clientConnection:
+        kubeconfig: /etc/rancher/k3s/k3s.yaml
+      profiles:
+      - pluginConfig:
+        - args:
+            scoringStrategy:
+              resources:
+              - name: cpu
+                weight: 1
+              - name: memory
+                weight: 1
+              - name: nvidia.com/gpu
+                weight: 3
+              type: MostAllocated
+          name: NodeResourcesFit
+    
